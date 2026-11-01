@@ -1,0 +1,170 @@
+// SPLIT SCREEN - multiplayer server
+// Run:  npm install && npm start      (default port 3000, or process.env.PORT)
+// It serves ./public (put game.html there) AND handles the realtime part.
+
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const { Server } = require('socket.io');
+
+const PORT = process.env.PORT || 3000;
+const TARGET_SCORE = 10;        // first to 10 wins the match
+const HIT_GATE_MS = 3500;       // ignore hits during the 3-2-1 countdown
+const NEXT_ROUND_DELAY = 2000;  // pause after a point before the next countdown
+const MATCH_END_DELAY = 2000;   // pause after the final point before the result screen
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } }); // CORS open so the page can also be hosted elsewhere
+
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('/ping', (req, res) => res.send('ok')); // used by uptime monitors to keep the server awake
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'game.html')));
+
+let queue = [];            // sockets waiting for an opponent
+const rooms = new Map();   // roomId -> room
+let roomCounter = 0;
+
+/* ---------- stats / presence ---------- */
+let statsTimer = null;
+function stats() {
+  return { online: io.engine.clientsCount, searching: queue.length, playing: rooms.size * 2 };
+}
+function broadcastStats() {
+  if (statsTimer) return;
+  statsTimer = setTimeout(() => { statsTimer = null; io.emit('stats', stats()); }, 250);
+}
+
+/* ---------- rooms ---------- */
+function createRoom(a, b) {
+  const id = 'r' + (++roomCounter);
+  const aIsBlue = Math.random() < 0.5;
+  const room = {
+    id,
+    players: { mavi: aIsBlue ? a : b, kirmizi: aIsBlue ? b : a },
+    ready: { mavi: false, kirmizi: false },
+    scores: { mavi: 0, kirmizi: 0 },
+    round: 0, active: false, activeAt: 0, over: false, timer: null
+  };
+  rooms.set(id, room);
+  for (const side of ['mavi', 'kirmizi']) {
+    const s = room.players[side];
+    s.join(id);
+    s.data.roomId = id;
+    s.data.side = side;
+    s.emit('matchFound', { side, target: TARGET_SCORE });
+  }
+}
+
+function startRound(room) {
+  if (room.over) return;
+  room.round++;
+  room.active = true;
+  room.activeAt = Date.now() + HIT_GATE_MS;
+  io.to(room.id).emit('roundStart', { round: room.round, scores: room.scores });
+}
+
+function closeRoom(room) {
+  clearTimeout(room.timer);
+  for (const side of ['mavi', 'kirmizi']) {
+    const s = room.players[side];
+    if (s) { s.leave(room.id); s.data.roomId = null; s.data.side = null; }
+  }
+  rooms.delete(room.id);
+  broadcastStats();
+}
+
+function leaveRoom(socket) {
+  const room = rooms.get(socket.data.roomId);
+  if (!room) return;
+  if (!room.over) socket.to(room.id).emit('opponentLeft');
+  closeRoom(room);
+}
+
+/* ---------- sockets ---------- */
+io.on('connection', (socket) => {
+  socket.data.roomId = null;
+  socket.data.side = null;
+  socket.data.lastFire = 0;
+  socket.emit('stats', stats());
+  broadcastStats();
+
+  socket.on('findMatch', () => {
+    if (socket.data.roomId || queue.includes(socket)) return;
+    queue = queue.filter((s) => s.connected);
+    const opponent = queue.shift();
+    if (opponent) createRoom(opponent, socket);
+    else queue.push(socket);
+    broadcastStats();
+  });
+
+  socket.on('cancelSearch', () => {
+    queue = queue.filter((s) => s !== socket);
+    broadcastStats();
+  });
+
+  socket.on('ready', () => {
+    const room = rooms.get(socket.data.roomId);
+    if (!room || room.over) return;
+    room.ready[socket.data.side] = true;
+    if (room.ready.mavi && room.ready.kirmizi && room.round === 0) startRound(room);
+  });
+
+  // realtime position relay
+  socket.on('state', (d) => {
+    const roomId = socket.data.roomId;
+    if (!roomId || !d) return;
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, Number(v) || 0));
+    socket.to(roomId).volatile.emit('state', {
+      x: clamp(d.x, -24, 24), y: clamp(d.y, 0, 10), dx: clamp(d.dx, -1, 1), j: !!d.j
+    });
+  });
+
+  // laser fired
+  socket.on('fire', (d) => {
+    const roomId = socket.data.roomId;
+    const now = Date.now();
+    if (!roomId || !d || now - socket.data.lastFire < 80) return;
+    socket.data.lastFire = now;
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, Number(v) || 0));
+    socket.to(roomId).emit('fire', { x: clamp(d.x, -24, 24), y: clamp(d.y, 0, 10) });
+  });
+
+  // the victim's client reports that it was hit
+  socket.on('hit', () => {
+    const room = rooms.get(socket.data.roomId);
+    if (!room || room.over || !room.active || Date.now() < room.activeAt) return;
+    room.active = false;
+    const victim = socket.data.side;
+    const winner = victim === 'mavi' ? 'kirmizi' : 'mavi';
+    room.scores[winner]++;
+    io.to(room.id).emit('point', { winner, scores: room.scores });
+
+    if (room.scores[winner] >= TARGET_SCORE) {
+      room.over = true;
+      room.timer = setTimeout(() => {
+        io.to(room.id).emit('matchEnd', { winner, scores: room.scores });
+        closeRoom(room);
+      }, MATCH_END_DELAY);
+    } else {
+      room.timer = setTimeout(() => startRound(room), NEXT_ROUND_DELAY);
+    }
+  });
+
+  socket.on('leaveMatch', () => leaveRoom(socket));
+
+  socket.on('disconnect', () => {
+    queue = queue.filter((s) => s !== socket);
+    leaveRoom(socket);
+    broadcastStats();
+  });
+});
+
+server.listen(PORT, () => console.log('SPLIT SCREEN server running on port ' + PORT));
+
+// Keep-alive: the server visits its own public address every 8 minutes so free hosts
+// (Render) don't put it to sleep. Render fills RENDER_EXTERNAL_URL automatically.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE_URL;
+if (SELF_URL) {
+  setInterval(() => { fetch(SELF_URL + '/ping').catch(() => {}); }, 8 * 60 * 1000);
+}
